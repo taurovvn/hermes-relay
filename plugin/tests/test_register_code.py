@@ -493,7 +493,12 @@ class PairCommandTests(unittest.TestCase):
         ), patch.object(
             pair, "build_endpoint_candidates", return_value=[]
         ), patch.object(
-            pair, "build_payload", side_effect=fake_build_payload
+            # Current Relay servers mint the invite through /pairing/mint. None
+            # exercises the pre-mint compatibility path this test covers, which
+            # is what builds the payload locally from the CLI pairing code.
+            pair, "mint_relay_pairing", return_value=None
+        ), patch.object(
+            pair, "build_pairing_qr_payload", side_effect=fake_build_payload
         ):
             out = io.StringIO()
             with redirect_stdout(out):
