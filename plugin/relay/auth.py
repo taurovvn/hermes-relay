@@ -78,7 +78,12 @@ DEFAULT_TTL_SECONDS: float = 30 * 24 * 3600  # 30 days
 # If the overall TTL is shorter than a cap, the shorter value wins — grants
 # never outlive the session itself.
 DEFAULT_TERMINAL_CAP: float = 30 * 24 * 3600  # 30 days
-DEFAULT_BRIDGE_CAP: float = 7 * 24 * 3600  # 7 days
+# 2026-10-20: bridge cap raised 7d -> 30d. The 7d cap made the Android
+# bridge grant expire every week while the session (and the trusted-device
+# refresh) lived 30d/180d, so the phone's bridge traffic was rejected with
+# "bridge grant expired" until a re-pair. Match terminal/tui so bridge tracks
+# the session lifetime. Local operator patch.
+DEFAULT_BRIDGE_CAP: float = 30 * 24 * 3600  # 30 days
 DEFAULT_TUI_CAP: float = 30 * 24 * 3600  # 30 days (desktop TUI — Phase 1 MVP)
 VOICE_GRANT_KEYS: tuple[str, ...] = (
     "voice:config",

@@ -17,7 +17,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from plugin.relay.config import _load_profiles, _pid_is_alive, _read_proc_start_time
+from plugin.relay.config import (
+    _load_profiles,
+    _pid_is_alive,
+    _profile_prefix_cache,
+    _read_proc_start_time,
+)
 
 
 class PidLivenessProbeTests(unittest.TestCase):
@@ -699,6 +704,88 @@ class ProfileDiscoveryTests(unittest.TestCase):
             "https://hermes.example.test:8660",
         )
         self.assertTrue(entry["api_server_key_present"])
+
+    # ── enrichment: profile-scoped ``/p/<profile>`` gateway route ──────
+
+    def _write_shared_gateway_profile(
+        self,
+        name: str,
+        *,
+        default_key: str = "shared-secret",
+        profile_key: str | None = "shared-secret",
+        port: int = 8642,
+    ) -> Path:
+        (self.hermes_dir / ".env").write_text(
+            f"API_SERVER_KEY={default_key}\n", encoding="utf-8"
+        )
+        pdir = self._write_profile(
+            name,
+            config_body="model:\n  default: x\n",
+            soul=None,
+        )
+        lines = [f"API_SERVER_PORT={port}"]
+        if profile_key is not None:
+            lines.append(f"API_SERVER_KEY={profile_key}")
+        (pdir / ".env").write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return pdir
+
+    def _assert_profile_url(
+        self,
+        *,
+        expected_url: str,
+        probe_result: bool | None,
+    ) -> None:
+        _ = self._write_shared_gateway_profile("coder")
+        with patch(
+            "plugin.relay.config._probe_profile_prefix", return_value=probe_result
+        ):
+            out = self._load(base_api_url="https://hermes.example.test:8642")
+        coder = next(p for p in out if p["name"] == "coder")
+        self.assertEqual(coder["api_server_url"], expected_url)
+
+    def test_shared_gateway_profile_gets_scoped_route_when_served(self) -> None:
+        """Same origin + same credential + a live ``/p/`` route -> scoped URL."""
+        self._write_root_config()
+        _profile_prefix_cache.clear()
+        self.addCleanup(_profile_prefix_cache.clear)
+        self._assert_profile_url(
+            expected_url="https://hermes.example.test:8642/p/coder",
+            probe_result=True,
+        )
+
+    def test_shared_gateway_profile_keeps_root_when_route_missing(self) -> None:
+        self._write_root_config()
+        _profile_prefix_cache.clear()
+        self.addCleanup(_profile_prefix_cache.clear)
+        self._assert_profile_url(
+            expected_url="https://hermes.example.test:8642",
+            probe_result=False,
+        )
+
+    def test_shared_gateway_profile_keeps_root_when_probe_unreachable(self) -> None:
+        self._write_root_config()
+        _profile_prefix_cache.clear()
+        self.addCleanup(_profile_prefix_cache.clear)
+        self._assert_profile_url(
+            expected_url="https://hermes.example.test:8642",
+            probe_result=None,
+        )
+
+    def test_distinct_profile_credential_never_gets_scoped_route(self) -> None:
+        """A different profile key would be rejected on ``/p/`` — don't advertise it."""
+        self._write_root_config()
+        _profile_prefix_cache.clear()
+        self.addCleanup(_profile_prefix_cache.clear)
+        _ = self._write_shared_gateway_profile(
+            "coder", profile_key="a-different-key"
+        )
+        with patch(
+            "plugin.relay.config._probe_profile_prefix", return_value=True
+        ) as probe:
+            out = self._load(base_api_url="https://hermes.example.test:8642")
+        coder = next(p for p in out if p["name"] == "coder")
+        self.assertEqual(coder["api_server_url"], "https://hermes.example.test:8642")
+        probe.assert_not_called()
 
 
 if __name__ == "__main__":

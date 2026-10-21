@@ -11,7 +11,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import uuid
+from pathlib import Path
+from urllib.parse import quote
 from datetime import UTC, datetime
 from typing import Any
 
@@ -171,11 +174,72 @@ class ChatHandler:
     The HTTP session is created lazily and reused across requests.
     """
 
-    def __init__(self, webapi_url: str = "http://localhost:8642") -> None:
+    def __init__(self, webapi_url: str = "http://localhost:8642", config: Any = None) -> None:
         self._webapi_url = webapi_url.rstrip("/")
+        self._config = config
         self._http: aiohttp.ClientSession | None = None
         self._client_capabilities: dict[int, dict[str, Any]] = {}
         self._stream_seq: dict[str, int] = {}
+
+    def _profile_home(self, profile: str) -> "Path | None":
+        if self._config is None:
+            return None
+        try:
+            from ..config import _effective_default_profile_home
+
+            hermes_dir = Path(self._config.hermes_config_path).expanduser().parent
+        except Exception:
+            return None
+        if not profile or profile == "default":
+            return _effective_default_profile_home(hermes_dir)
+        return hermes_dir / "profiles" / profile
+
+    def _profile_api_key(self, profile: str) -> "str | None":
+        """Return the bearer key that authenticates ``profile``'s API server.
+
+        Profiles may carry their own ``API_SERVER_KEY``; when they do not, the
+        shared Hermes key (root config/.env) authenticates the multiplexed
+        ``/p/<profile>`` route too.
+        """
+        home = self._profile_home(profile)
+        if home is not None:
+            try:
+                from ..config import _profile_dotenv_values
+
+                key = _profile_dotenv_values(home).get("API_SERVER_KEY")
+                if key:
+                    return key
+            except Exception:
+                pass
+        if self._config is not None:
+            try:
+                from ..config import hermes_api_server_key
+
+                key = hermes_api_server_key(self._config)
+                if key:
+                    return key
+            except Exception:
+                pass
+        return os.getenv("API_SERVER_KEY")
+
+    def _profile_prefix_served(self, profile: str) -> bool:
+        """Whether the shared gateway serves ``/p/<profile>`` for this profile."""
+        try:
+            from ..config import _profile_prefix_served
+
+            return _profile_prefix_served(self._webapi_url, profile)
+        except Exception:
+            return False
+
+    def _profile_webapi_url(self, profile: str) -> str:
+        if not profile or profile == "default":
+            return self._webapi_url
+        # Only use the multiplexed profile route when this gateway actually
+        # serves it; otherwise fall back to the root API (which accepts an
+        # explicit ``profile`` on session creation).
+        if not self._profile_prefix_served(profile):
+            return self._webapi_url
+        return f"{self._webapi_url}/p/{quote(profile, safe='')}"
 
     def set_client_capabilities(
         self, ws: web.WebSocketResponse, capabilities: dict[str, Any] | None
@@ -251,7 +315,7 @@ class ChatHandler:
         msg_id: str | None,
     ) -> None:
         """Process a chat.send message: create session if needed, then stream."""
-        profile = payload.get("profile", "default")
+        profile = payload.get("profile", "default") or "default"
         session_id = payload.get("session_id")
         message = payload.get("message", "")
         # attachments = payload.get("attachments", [])  # TODO: Phase 2+
@@ -268,14 +332,20 @@ class ChatHandler:
 
         http = await self._get_http()
 
+        profile_webapi_url = self._profile_webapi_url(profile)
+        auth_headers: dict[str, str] = {"Accept": "text/event-stream"}
+        api_key = self._profile_api_key(profile)
+        if api_key:
+            auth_headers["Authorization"] = f"Bearer {api_key}"
+
         # If no session_id provided, create a new session
         if not session_id:
-            session_id = await self._create_session(ws, http, profile, msg_id)
+            session_id = await self._create_session(ws, http, profile, msg_id, profile_webapi_url, api_key)
             if session_id is None:
                 return  # Error already sent
 
         # POST to the streaming chat endpoint
-        url = f"{self._webapi_url}/api/sessions/{session_id}/chat/stream"
+        url = f"{profile_webapi_url}/api/sessions/{session_id}/chat/stream"
         request_body: dict[str, Any] = {"message": message}
 
         # Include profile if the WebAPI supports it
@@ -293,7 +363,7 @@ class ChatHandler:
             async with http.post(
                 url,
                 json=request_body,
-                headers={"Accept": "text/event-stream"},
+                headers=auth_headers,
             ) as resp:
                 if resp.status != 200:
                     body = await resp.text()
@@ -333,15 +403,24 @@ class ChatHandler:
         http: aiohttp.ClientSession,
         profile: str,
         msg_id: str | None,
+        profile_webapi_url: str | None = None,
+        api_key: str | None = None,
     ) -> str | None:
         """Create a new chat session via the WebAPI. Returns session_id or None."""
-        url = f"{self._webapi_url}/api/sessions"
+        base = (profile_webapi_url or self._profile_webapi_url(profile)).rstrip("/")
+        url = f"{base}/api/sessions"
         body: dict[str, Any] = {}
         if profile and profile != "default":
             body["profile"] = profile
 
+        headers: dict[str, str] = {}
+        if api_key is None:
+            api_key = self._profile_api_key(profile)
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
         try:
-            async with http.post(url, json=body) as resp:
+            async with http.post(url, json=body, headers=headers) as resp:
                 if resp.status not in (200, 201):
                     text = await resp.text()
                     logger.error(
@@ -619,14 +698,20 @@ class ChatHandler:
     ) -> None:
         """Fetch session list from WebAPI and forward to the phone."""
         http = await self._get_http()
-        url = f"{self._webapi_url}/api/sessions"
+        profile = payload.get("profile") or "default"
+        base = self._profile_webapi_url(profile)
+        url = f"{base}/api/sessions"
         params: dict[str, str] = {}
-        profile = payload.get("profile")
-        if profile:
+        if profile and profile != "default":
             params["profile"] = profile
 
+        headers: dict[str, str] = {}
+        api_key = self._profile_api_key(profile)
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+
         try:
-            async with http.get(url, params=params) as resp:
+            async with http.get(url, params=params, headers=headers) as resp:
                 if resp.status != 200:
                     body = await resp.text()
                     logger.error(

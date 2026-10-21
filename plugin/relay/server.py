@@ -269,7 +269,7 @@ class RelayServer:
         self.model_capabilities = ModelCapabilityResolver(config)
 
         # Channel handlers
-        self.chat = ChatHandler(webapi_url=config.webapi_url)
+        self.chat = ChatHandler(webapi_url=config.webapi_url, config=config)
         self.terminal = TerminalHandler(default_shell=config.terminal_shell)
         self.bridge = BridgeHandler()
         self.tui = TuiHandler()
