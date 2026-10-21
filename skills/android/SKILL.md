@@ -272,7 +272,7 @@ Hermes-Relay ships in two build flavors: `googlePlay` (Play Store, conservative 
 - **Full accessibility capability set.** `typeAllMask`, gesture dispatch, interactive windows, view IDs — used by the direct tools under the hood. The Play flavor uses a narrower subset.
 - **Location queries.** Phone-side, voice-triggered only.
 
-Agent rule: **you do not need to know which flavor is running to use the `android_*` tools**. Every tool in section 3 works in both flavors. The flavor only matters if you're building a feature that requires sideload capabilities, in which case check `BuildFlavor.current` on the phone side, not from the tool layer.
+Agent rule: **do not infer device-control availability from the build flavor or a connected phone alone**. Read `/bridge/status`: when `device_control_supported` is false, or required accessibility/master-control permissions are absent, do not attempt UI navigation. A connected Google Play client may support telemetry or notification access without device control. Use the reported capabilities, not an assumption that every tool works in both flavors. For developing flavor-gated features, check `BuildFlavor.current` on the phone side.
 
 ## 11. Extending this skill
 
