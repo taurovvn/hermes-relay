@@ -200,6 +200,9 @@ systemctl --user restart hermes-relay
 ### `phone_connected: false` plus `last_seen_seconds_ago: null`
 No phone has ever pushed a status envelope to this relay process. This is the normal pre-pairing state — pair a phone first.
 
+### Relay connects but the agent's turns fail with `invalid_params`
+The relay attaches to the live gateway over `/api/ws` (Hermes ≥ 0.22.5 refuses a second `tui_gateway` beside the owner). If `journalctl --user -u hermes-relay | grep 'attached to gateway'` shows a link but a spoken/chat turn errors `invalid_params`, the submit is missing its idempotency key: `gateway/session_controls.py::submission()` requires `submission_id` or `input_id`. Patch the relay to inject one (`_with_submission_id` in `plugin/relay/channels/tui.py`) rather than editing the compiled desktop client. `permission_denied` instead means the request reached a session owned by another ticket — the relay must submit on the same link that created the session.
+
 ### Phone is paired but the agent's `android_*` tool calls fail
 Check that the bridge is enabled AND the relevant permission is granted. Use `hermes-status` to see what's actually granted. If `screen_capture_granted` is false, the user needs to tap the Screen Capture row in the Bridge tab to launch the system consent dialog. If `accessibility_granted` is false, they need to enable `Hermes-Bridge` in Android Settings → Accessibility.
 

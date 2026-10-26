@@ -85,6 +85,50 @@ def _ext_for_content_type(content_type: str | None) -> str:
     return _AUDIO_EXT_BY_CONTENT_TYPE.get(base, ".wav")
 
 
+def _tts_render_dir() -> str | None:
+    """Return a directory upstream's TTS path guard will accept for renders.
+
+    Hermes refuses an explicit TTS ``output_path`` outside its write-safe roots
+    (or in a credential/system location) with "output_path targets a protected
+    credential or system path". Those roots are whatever ``HERMES_WRITE_SAFE_ROOT``
+    lists when the host runs in write lockdown — and the system temp dir is not
+    one of them, so a plain ``tempfile.mkstemp()`` render fails before any
+    provider is reached and every ``/voice/synthesize`` call 500s.
+
+    Preference order: ``RELAY_VOICE_RENDER_DIR`` override, the Hermes scratch
+    dir, the relay's own state dir, then the system temp dir. Each candidate is
+    probed with the same guard upstream uses; the first accepted one wins.
+    ``None`` means "let tempfile use the system default".
+    """
+    candidates: list[Path] = []
+    override = os.getenv("RELAY_VOICE_RENDER_DIR", "").strip()
+    if override:
+        candidates.append(Path(override).expanduser())
+    hermes_home = Path(
+        os.getenv("HERMES_HOME") or (Path.home() / ".hermes")
+    ).expanduser()
+    candidates.append(hermes_home / "cache" / "scratch" / "relay-voice-renders")
+    relay_home = Path(
+        os.getenv("HERMES_RELAY_HOME") or (Path.home() / ".hermes-relay")
+    ).expanduser()
+    candidates.append(relay_home / "voice-renders")
+
+    try:  # Upstream helper; absent on installs that predate the path guard.
+        from agent.file_safety import is_write_denied  # type: ignore
+    except Exception:  # pragma: no cover - upstream drift
+        is_write_denied = None  # type: ignore[assignment]
+
+    for candidate in candidates:
+        try:
+            candidate.mkdir(parents=True, exist_ok=True)
+            candidate.chmod(0o700)
+        except OSError:
+            continue
+        if is_write_denied is None or not is_write_denied(str(candidate / "probe.mp3")):
+            return str(candidate)
+    return None
+
+
 class VoiceHandler:
     """Routes + small amount of per-request state for the voice endpoints.
 
@@ -307,7 +351,17 @@ class VoiceHandler:
         # ~/voice-memos and never cleans up (unbounded disk growth on a
         # long-lived relay). mkstemp yields an absolute path with no ".."
         # traversal component, which upstream's path guard requires.
-        out_fd, out_path = tempfile.mkstemp(suffix=".mp3", prefix="hermes-tts-")
+        #
+        # The directory must ALSO sit inside upstream's write-safe roots: a
+        # host running under HERMES_WRITE_SAFE_ROOT (write lockdown) rejects a
+        # /tmp render with "output_path targets a protected credential or
+        # system path" before any provider is reached. _tts_render_dir() picks
+        # a directory the guard accepts.
+        out_fd, out_path = tempfile.mkstemp(
+            suffix=".mp3",
+            prefix="hermes-tts-",
+            dir=_tts_render_dir(),
+        )
         os.close(out_fd)
         served_path: str | None = None
         try:

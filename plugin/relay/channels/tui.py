@@ -123,10 +123,13 @@ def _resolve_python_executable(src_root: str) -> str:
 
 @dataclass
 class _TuiSession:
-    """Per-WebSocket subprocess state."""
+    """Per-WebSocket agent link: an attached gateway WS, or a spawned runtime."""
 
-    proc: asyncio.subprocess.Process
     ws: web.WebSocketResponse
+    proc: asyncio.subprocess.Process | None = None
+    gw: Any = None  # aiohttp.ClientWebSocketResponse (attach mode)
+    http: Any = None  # aiohttp.ClientSession that owns ``gw``
+    mode: str = "spawn"  # "attach" | "spawn"
     reader_task: asyncio.Task[None] | None = None
     stderr_task: asyncio.Task[None] | None = None
     stdin_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
@@ -195,16 +198,141 @@ class TuiHandler:
         ws: web.WebSocketResponse,
         payload: dict[str, Any],
     ) -> None:
-        """Spawn ``python -m tui_gateway.entry`` for this client."""
-        # Re-attach on an existing session is idempotent — kill the old
-        # subprocess and start fresh. The desktop client only needs this
+        """Attach to the running gateway; spawn a runtime only as a fallback."""
+        # Re-attach on an existing session is idempotent — tear the old
+        # link down and start fresh. The desktop client only needs this
         # path on a reconnect; a duplicate attach on a live session is
         # treated as "user really means it".
         existing = self._sessions.get(ws)
         if existing is not None:
-            logger.info("tui: re-attach on live session, killing previous subprocess")
+            logger.info("tui: re-attach on live session, tearing down previous link")
             await self._teardown_session(existing, reason="re-attach")
 
+        if await self._attach_to_gateway(ws, payload):
+            return
+        await self._spawn_session(ws, payload)
+
+    async def _attach_to_gateway(
+        self,
+        ws: web.WebSocketResponse,
+        payload: dict[str, Any],
+    ) -> bool:
+        """Dial the live gateway's ``/api/ws`` with a session ticket.
+
+        Hermes >= 0.22.5 refuses to start ``tui_gateway.entry`` beside a
+        gateway that already owns the home ("owned by a running gateway;
+        attach to it instead"), so the supported shape is to attach to the
+        owner. Discovery, the ticket mint and the WS target all come from
+        the same helpers the Ink/Desktop bootstraps use, so the relay can
+        never drift from the core attach contract.
+        """
+        try:
+            import aiohttp
+
+            from hermes_constants import get_hermes_home
+            from hermes_cli.gateway_client import gateway_ws_target
+            from hermes_cli.gateway_runtime import (
+                attachable,
+                control_home_for,
+                discover_gateway_endpoint,
+            )
+            from hermes_cli.gateway_runtime_discovery import connect_private
+        except ImportError as exc:
+            logger.debug("tui: attach unavailable (%s) — falling back to spawn", exc)
+            return False
+
+        try:
+            home = Path(get_hermes_home())
+            profile = payload.get("profile")
+            if isinstance(profile, str) and profile:
+                candidate = home / "profiles" / profile
+                if candidate.is_dir():
+                    home = candidate
+
+            receipt = await asyncio.to_thread(
+                discover_gateway_endpoint, home, timeout=5
+            )
+            if not attachable(receipt):
+                logger.info("tui: no attachable gateway for %s — falling back to spawn", home)
+                return False
+            endpoint = receipt.endpoint
+            control = control_home_for(home, endpoint)
+            request = json.dumps(
+                {
+                    "protocol": 1,
+                    "id": 1,
+                    "verb": "session-ticket",
+                    "params": {
+                        "profile_id": endpoint.profile_id,
+                        "instance_id": endpoint.instance_id,
+                        "purpose": "interactive",
+                    },
+                }
+            ).encode() + b"\n"
+
+            def _mint_ticket() -> dict[str, Any]:
+                with connect_private(control, 5) as peer:
+                    peer.sendall(request)
+                    with peer.makefile("rb") as stream:
+                        return json.loads(stream.readline(65537))
+
+            result = await asyncio.to_thread(_mint_ticket)
+            grant = result.get("result") or {}
+            ticket = grant.get("ticket")
+            if result.get("ok") is not True or not isinstance(ticket, str):
+                logger.warning("tui: gateway ticket refused: %s", str(result)[:200])
+                return False
+
+            url, protocols = gateway_ws_target(endpoint, ticket)
+            http = aiohttp.ClientSession()
+            try:
+                gw = await http.ws_connect(
+                    url,
+                    protocols=protocols,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    heartbeat=30,
+                )
+            except Exception:
+                await http.close()
+                raise
+            expected = protocols[0] if protocols else None
+            if expected and gw.protocol != expected:
+                logger.warning(
+                    "tui: gateway WS subprotocol mismatch (%s != %s)", gw.protocol, expected
+                )
+                await gw.close()
+                await http.close()
+                return False
+
+            session = _TuiSession(ws=ws, gw=gw, http=http, mode="attach")
+            async with self._lock:
+                self._sessions[ws] = session
+            session.reader_task = asyncio.create_task(
+                self._pump_gateway(session), name="tui-gateway-pump"
+            )
+            if not ws.closed:
+                await ws.send_str(
+                    _envelope(
+                        "tui.attached",
+                        {
+                            "pid": os.getpid(),
+                            "server_version": __version__,
+                            "mode": "attach",
+                        },
+                    )
+                )
+            logger.info("tui: attached to gateway %s for ws=%s", url, id(ws))
+            return True
+        except Exception as exc:
+            logger.warning("tui: gateway attach failed (%s) — falling back to spawn", exc)
+            return False
+
+    async def _spawn_session(
+        self,
+        ws: web.WebSocketResponse,
+        payload: dict[str, Any],
+    ) -> None:
+        """Spawn ``python -m tui_gateway.entry`` (hosts with no live gateway)."""
         src_root = _resolve_python_src_root()
         python = _resolve_python_executable(src_root)
         cwd = os.environ.get("HERMES_CWD") or src_root
@@ -250,7 +378,7 @@ class TuiHandler:
             await self._send_error(ws, f"failed to spawn tui_gateway: {exc}")
             return
 
-        session = _TuiSession(proc=proc, ws=ws)
+        session = _TuiSession(ws=ws, proc=proc, mode="spawn")
         async with self._lock:
             self._sessions[ws] = session
 
@@ -267,7 +395,7 @@ class TuiHandler:
             await ws.send_str(
                 _envelope(
                     "tui.attached",
-                    {"pid": proc.pid, "server_version": __version__},
+                    {"pid": proc.pid, "server_version": __version__, "mode": "spawn"},
                 )
             )
         logger.info("tui: spawned tui_gateway pid=%s for ws=%s", proc.pid, id(ws))
@@ -286,7 +414,27 @@ class TuiHandler:
                 ws, "no active tui session — send tui.attach first"
             )
             return
-        await self._write_rpc(session, payload)
+        await self._write_rpc(session, self._with_submission_id(payload))
+
+    @staticmethod
+    def _with_submission_id(obj: dict[str, Any]) -> dict[str, Any]:
+        """Give ``prompt.submit`` the idempotency key the gateway now demands.
+
+        ``gateway.session_controls.submission()`` refuses a submit carrying
+        neither ``submission_id`` nor ``input_id`` as a bare ``invalid_params``
+        (Hermes >= 0.22.5). The desktop relay client's voice path sends neither,
+        so every spoken turn was rejected before admission. Mint a fresh key per
+        submit: each distinct submit IS a distinct turn, which is exactly what
+        the key means. Already-keyed submits pass through untouched.
+        """
+        if obj.get("method") != "prompt.submit":
+            return obj
+        params = obj.get("params")
+        if not isinstance(params, dict):
+            return obj
+        if params.get("submission_id") or params.get("input_id"):
+            return obj
+        return {**obj, "params": {**params, "submission_id": uuid.uuid4().hex}}
 
     async def _handle_resize(
         self,
@@ -321,8 +469,26 @@ class TuiHandler:
         session: _TuiSession,
         obj: dict[str, Any],
     ) -> None:
-        """Serialize ``obj`` as a single line and write to subprocess stdin."""
-        stdin = session.proc.stdin
+        """Send a JSON-RPC object to the attached gateway (or subprocess stdin)."""
+        if session.mode == "attach":
+            gw = session.gw
+            if gw is None or gw.closed:
+                await self._send_error(session.ws, "gateway link is not open")
+                return
+            try:
+                payload = json.dumps(obj)
+            except (TypeError, ValueError) as exc:
+                await self._send_error(session.ws, f"malformed RPC payload: {exc}")
+                return
+            async with session.stdin_lock:
+                try:
+                    await gw.send_str(payload)
+                except (ConnectionResetError, RuntimeError) as exc:
+                    logger.warning("tui: gateway write failed: %s", exc)
+                    await self._send_error(session.ws, f"gateway write failed: {exc}")
+            return
+
+        stdin = session.proc.stdin if session.proc is not None else None
         if stdin is None or session.proc.returncode is not None:
             await self._send_error(session.ws, "tui_gateway subprocess is not running")
             return
@@ -397,6 +563,54 @@ class TuiHandler:
                     f"tui_gateway exited (code={session.proc.returncode})",
                 )
 
+    async def _pump_gateway(self, session: _TuiSession) -> None:
+        """Forward gateway WS frames to the client as ``tui.rpc.*`` envelopes."""
+        import aiohttp
+
+        ws = session.ws
+        gw = session.gw
+        try:
+            async for msg in gw:
+                if msg.type == aiohttp.WSMsgType.TEXT:
+                    raw = msg.data
+                elif msg.type == aiohttp.WSMsgType.BINARY:
+                    raw = msg.data.decode("utf-8", "replace")
+                elif msg.type in (
+                    aiohttp.WSMsgType.CLOSE,
+                    aiohttp.WSMsgType.CLOSING,
+                    aiohttp.WSMsgType.CLOSED,
+                    aiohttp.WSMsgType.ERROR,
+                ):
+                    break
+                else:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except json.JSONDecodeError:
+                    logger.warning("tui: malformed gateway frame: %s", str(raw)[:200])
+                    continue
+
+                # Classify exactly as the stdio pump does: a notification is
+                # an event, anything with an ``id`` is a response.
+                msg_type = "tui.rpc.response"
+                if isinstance(obj, dict):
+                    if obj.get("method") == "event" or "id" not in obj:
+                        msg_type = "tui.rpc.event"
+
+                if ws.closed:
+                    break
+                try:
+                    await ws.send_str(_envelope(msg_type, obj))
+                except ConnectionResetError:
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # pragma: no cover — defensive
+            logger.exception("tui: gateway pump crashed")
+        finally:
+            if not session.closing:
+                await self._send_error(ws, "gateway connection closed")
+
     async def _pump_stderr(self, session: _TuiSession) -> None:
         """Drain subprocess stderr into the relay log so the pipe can't fill.
 
@@ -456,11 +670,35 @@ class TuiHandler:
         session: _TuiSession,
         reason: str = "",
     ) -> None:
-        """SIGTERM → 2s → SIGKILL. Also cancels the pumps."""
+        """Close the gateway link, or SIGTERM → 2s → SIGKILL a spawned runtime."""
         if session.closing:
             return
         session.closing = True
+
+        if session.mode == "attach":
+            task = session.reader_task
+            if task is not None and not task.done():
+                task.cancel()
+                try:
+                    await task
+                except (asyncio.CancelledError, Exception):
+                    pass
+            if session.gw is not None:
+                try:
+                    await session.gw.close()
+                except Exception:  # pragma: no cover — defensive
+                    pass
+            if session.http is not None:
+                try:
+                    await session.http.close()
+                except Exception:  # pragma: no cover — defensive
+                    pass
+            logger.info("tui: detached gateway link (reason=%s)", reason or "unspecified")
+            return
+
         proc = session.proc
+        if proc is None:
+            return
         pid = proc.pid
 
         if proc.returncode is None:

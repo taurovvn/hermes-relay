@@ -176,8 +176,11 @@ async function handleTurn(req: IncomingMessage, res: ServerResponse, ctx: Handle
     try { if (!res.writableEnded) res.end() } catch { /* ignore */ }
   }
 
-  // Drop the connection if the browser navigates away mid-turn.
-  req.on('close', () => { try { abort.abort() } catch { /* ignore */ } })
+  // Drop the connection if the browser navigates away mid-turn. Listen on
+  // `res`, not `req`: `req` emits 'close' as soon as the request body is fully
+  // read (Node >= 16), which aborted the transcription fetch before it started
+  // and produced an empty SSE response on every voice turn.
+  res.on('close', () => { if (!res.writableEnded) { try { abort.abort() } catch { /* ignore */ } } })
 
   try {
     const audioMime = (req.headers['content-type'] ?? 'audio/webm').toString().split(';', 1)[0]?.trim() || 'audio/webm'
@@ -360,7 +363,7 @@ async function transcribeOnRelay(opts: {
     method: 'POST',
     headers: { Authorization: `Bearer ${opts.token}`, Accept: 'application/json' },
     body: form,
-    signal: opts.signal
+    signal: AbortSignal.any([opts.signal, AbortSignal.timeout(300_000)])
   })
 
   const txt = await sttRes.text()

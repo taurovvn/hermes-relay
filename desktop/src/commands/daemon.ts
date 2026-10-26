@@ -1383,7 +1383,9 @@ function waitForGatewayReady(gateway: GatewayClient, timeoutMs: number): Promise
 }
 
 async function createVoiceSession(gateway: GatewayClient): Promise<string> {
-  const raw = await gateway.request<SessionCreateResponse>('session.create', { cols: 80 })
+  // Hermes >= 0.22.5 validates session.create params strictly: unknown fields are
+  // refused with 4001 invalid_params (e.g. ['cols']). Send none.
+  const raw = await gateway.request<SessionCreateResponse>('session.create', {})
   const r = asRpcResult<SessionCreateResponse>(raw)
   if (!r?.session_id) throw new Error('voice session.create returned no session_id')
   return r.session_id
